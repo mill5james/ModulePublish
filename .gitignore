@@ -1,0 +1,8 @@
+bin/
+obj/
+.vscode
+.vs
+.localhistory
+*.user
+*.log
+*.code-workspace
