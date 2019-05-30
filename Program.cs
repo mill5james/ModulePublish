@@ -44,6 +44,7 @@ namespace ModulePublish
             await host.RunConsoleAsync();
         }
         private readonly ConcurrentQueue<DateTime> queue = new ConcurrentQueue<DateTime>();
+        private readonly CancellationTokenSource ctSource = new CancellationTokenSource();
         private readonly ILogger<Program> logger;
         private ModuleClient moduleClient;
 
@@ -54,38 +55,41 @@ namespace ModulePublish
 
         public async Task StartAsync(CancellationToken cancellationToken)
         {
-            //moduleClient = await ModuleClient.CreateFromEnvironmentAsync(); 
-            //await moduleClient.OpenAsync();
+            moduleClient = await ModuleClient.CreateFromEnvironmentAsync(); 
+            await moduleClient.OpenAsync(cancellationToken);
 
             Func<Task> sendMethod;
             if (sendBatch) 
-                sendMethod = () => SendBatchEvents(cancellationToken);
+                sendMethod = () => SendBatchEvents(ctSource.Token);
             else
-                sendMethod = () => SendSingleEvent(cancellationToken);
+                sendMethod = () => SendSingleEvent(ctSource.Token);
 
-            await Task.Factory.StartNew(() => Generator(cancellationToken), cancellationToken, TaskCreationOptions.LongRunning, TaskScheduler.Default);
-            await Task.Factory.StartNew(sendMethod, cancellationToken, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+            await Task.Factory.StartNew(() => Generator(ctSource.Token), TaskCreationOptions.LongRunning);
+            await Task.Factory.StartNew(sendMethod, TaskCreationOptions.LongRunning);
         }
 
         public Task StopAsync(CancellationToken cancellationToken)
         {
+            logger.LogInformation("Stopping");
+            ctSource.Cancel();
             moduleClient?.Dispose();
 
             return Task.CompletedTask;
         }
 
-        private async Task Generator(CancellationToken token)
+        private async Task Generator(CancellationToken cancellationToken)
         {
-            while (!token.IsCancellationRequested)
+            while (!cancellationToken.IsCancellationRequested)
             {
                 queue.Enqueue(DateTime.UtcNow);
                 await Task.Delay(interval);
             }
+            logger.LogInformation("Generator cancelled");
         }
 
-        private async Task SendSingleEvent(CancellationToken token)
+        private async Task SendSingleEvent(CancellationToken cancellationToken)
         {
-            while (!token.IsCancellationRequested)
+            while (!cancellationToken.IsCancellationRequested)
             {
                 if (!queue.TryDequeue(out var result)) {
                     await Task.Delay(interval / 2);
@@ -95,16 +99,17 @@ namespace ModulePublish
                 var body = JsonConvert.SerializeObject(new { result, lag });
                 logger.LogInformation("SendSingleEvent: {0} lag", lag);
                 var msg = new Message(Encoding.Unicode.GetBytes(body));
-                //await moduleClient.SendEventAsync(msg);
+                await moduleClient.SendEventAsync(msg, cancellationToken);
             }
+            logger.LogInformation("SendSingleEvent cancelled");
 
         }
-        private async Task SendBatchEvents(CancellationToken token)
+        private async Task SendBatchEvents(CancellationToken cancellationToken)
         {
             var msgs = new List<Message>(batchSize);
-            while (!token.IsCancellationRequested)
+            while (!cancellationToken.IsCancellationRequested)
             {
-                while ((msgs.Count < batchSize) && !token.IsCancellationRequested)
+                while ((msgs.Count < batchSize) && !cancellationToken.IsCancellationRequested)
                 {
                     if (!queue.TryDequeue(out var result)) {
                         await Task.Delay(interval / 2);
@@ -118,11 +123,12 @@ namespace ModulePublish
                 }
                 if (msgs.Any())
                 {
-                    //await moduleClient.SendEventBatchAsync(msgs);
+                    await moduleClient.SendEventBatchAsync(msgs, cancellationToken);
                     logger.LogInformation("wrote {0} messages", msgs.Count);
                     msgs.Clear();
                 }
             }
+            logger.LogInformation("SendBatchEvents cancelled");
         }
     }
 }
