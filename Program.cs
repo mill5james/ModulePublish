@@ -1,16 +1,16 @@
 ﻿using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Collections.Concurrent;
 using Microsoft.Azure.Devices.Client;
-using Newtonsoft.Json;
-using System.Text;
-using System.Collections.Generic;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.DependencyInjection;
-using System.Linq;
+using Newtonsoft.Json;
 
 namespace ModulePublish
 {
@@ -18,6 +18,7 @@ namespace ModulePublish
     {
         private static int interval;
         private static bool sendBatch;
+        private static int batchSize;
 
         public static async Task Main(string[] args)
         {
@@ -31,98 +32,93 @@ namespace ModulePublish
                 {
                     configLogging.AddConfiguration(hostContext.Configuration.GetSection("Logging"));
                     configLogging.AddConsole();
-                    configLogging.AddDebug();
-                }).ConfigureServices((hostContext, services) =>
+                })
+                .ConfigureServices((hostContext, services) =>
                 {
-                    services.AddOptions();
-                    
                     interval = hostContext.Configuration.GetValue<int>("IntervalMs", 1000);
                     sendBatch = hostContext.Configuration.GetValue<bool>("SendBatch", false);
+                    batchSize = hostContext.Configuration.GetValue<int>("BatchSize", 10);
+
                     services.AddSingleton<IHostedService, Program>();
                 });
             await host.RunConsoleAsync();
         }
         private readonly ConcurrentQueue<DateTime> queue = new ConcurrentQueue<DateTime>();
         private readonly ILogger<Program> logger;
+        private ModuleClient moduleClient;
 
-        public Program(ILogger<Program> logger) 
+        public Program(ILogger<Program> logger)
         {
             this.logger = logger;
-            
         }
 
         public async Task StartAsync(CancellationToken cancellationToken)
         {
-            //using (var moduleClient = await ModuleClient.CreateFromEnvironmentAsync()) 
-            using (var timer = new Timer((_) => queue.Enqueue(DateTime.UtcNow), null, 0, interval))
-            {
-                //await moduleClient.OpenAsync();
+            //moduleClient = await ModuleClient.CreateFromEnvironmentAsync(); 
+            //await moduleClient.OpenAsync();
 
-                Func<Task> sendMethod;
-                // if (sendBatch) 
-                //     sendMethod = () => SendBatchEvents(moduleClient, cancellationToken);
-                // else
-                //     sendMethod = () => SendSingleEvent(moduleClient, cancellationToken);
+            Func<Task> sendMethod;
+            if (sendBatch) 
+                sendMethod = () => SendBatchEvents(cancellationToken);
+            else
+                sendMethod = () => SendSingleEvent(cancellationToken);
 
-                await Task.Factory.StartNew(() => SendBatch(cancellationToken), cancellationToken, TaskCreationOptions.LongRunning, TaskScheduler.Default);
-            }
+            await Task.Factory.StartNew(() => Generator(cancellationToken), cancellationToken, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+            await Task.Factory.StartNew(sendMethod, cancellationToken, TaskCreationOptions.LongRunning, TaskScheduler.Default);
         }
 
-        public Task StopAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task StopAsync(CancellationToken cancellationToken)
+        {
+            moduleClient?.Dispose();
 
-        private async Task SendSingleEvent(ModuleClient moduleClient, CancellationToken token)
+            return Task.CompletedTask;
+        }
+
+        private async Task Generator(CancellationToken token)
         {
             while (!token.IsCancellationRequested)
             {
-                if (queue.TryDequeue(out var result))
-                {
-                    var lag = DateTime.UtcNow - result;
-                    var body = JsonConvert.SerializeObject(new { result, lag });
-                    var msg = new Message(Encoding.Unicode.GetBytes(body));
-                    await moduleClient.SendEventAsync(msg);
+                queue.Enqueue(DateTime.UtcNow);
+                await Task.Delay(interval);
+            }
+        }
+
+        private async Task SendSingleEvent(CancellationToken token)
+        {
+            while (!token.IsCancellationRequested)
+            {
+                if (!queue.TryDequeue(out var result)) {
+                    await Task.Delay(interval / 2);
+                    continue;
                 }
-                else
-                {
-                    await Task.Delay(interval);
-                }
+                var lag = DateTime.UtcNow - result;
+                var body = JsonConvert.SerializeObject(new { result, lag });
+                logger.LogInformation("SendSingleEvent: {0} lag", lag);
+                var msg = new Message(Encoding.Unicode.GetBytes(body));
+                //await moduleClient.SendEventAsync(msg);
             }
 
         }
-        private async Task SendBatchEvents(ModuleClient moduleClient, CancellationToken token)
+        private async Task SendBatchEvents(CancellationToken token)
         {
-            var msgs = new List<Message>(100);
+            var msgs = new List<Message>(batchSize);
             while (!token.IsCancellationRequested)
             {
-                if (msgs.Count < 100 && queue.TryDequeue(out var result))
+                while ((msgs.Count < batchSize) && !token.IsCancellationRequested)
                 {
+                    if (!queue.TryDequeue(out var result)) {
+                        await Task.Delay(interval / 2);
+                        continue;
+                    }
                     var lag = DateTime.UtcNow - result;
                     var body = JsonConvert.SerializeObject(new { result, lag });
+                    logger.LogInformation("SendBatchEvents: {0} lag", lag);
                     msgs.Add(new Message(Encoding.Unicode.GetBytes(body)));
+
                 }
-                else
+                if (msgs.Any())
                 {
-                    await Task.Delay(interval);
-                }
-                await moduleClient.SendEventBatchAsync(msgs);
-                msgs.Clear();
-            }
-        }
-        private async Task SendBatch(CancellationToken token)
-        {
-            var msgs = new List<Message>(10);
-            while (!token.IsCancellationRequested)
-            {
-                if (msgs.Count < 10 && queue.TryDequeue(out var result))
-                {
-                    var lag = DateTime.UtcNow - result;
-                    var body = JsonConvert.SerializeObject(new { result, lag });
-                    msgs.Add(new Message(Encoding.Unicode.GetBytes(body)));
-                }
-                else
-                {
-                    await Task.Delay(interval);
-                }
-                if (msgs.Any()) {
+                    //await moduleClient.SendEventBatchAsync(msgs);
                     logger.LogInformation("wrote {0} messages", msgs.Count);
                     msgs.Clear();
                 }
