@@ -1,15 +1,14 @@
 ﻿using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.Linq;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
-using System.Collections.Concurrent;
 using Microsoft.Azure.Devices.Client;
-using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Configuration;
-using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 using Newtonsoft.Json;
 
 namespace ModulePublish
@@ -106,10 +105,10 @@ namespace ModulePublish
         }
         private async Task SendBatchEvents(CancellationToken cancellationToken)
         {
-            var msgs = new List<Message>(batchSize);
+            var batch = new List<Message>(batchSize);
             while (!cancellationToken.IsCancellationRequested)
             {
-                while ((msgs.Count < batchSize) && !cancellationToken.IsCancellationRequested)
+                while ((batch.Count < batchSize) && !cancellationToken.IsCancellationRequested)
                 {
                     if (!queue.TryDequeue(out var result)) {
                         await Task.Delay(interval / 2);
@@ -118,14 +117,14 @@ namespace ModulePublish
                     var lag = DateTime.UtcNow - result;
                     var body = JsonConvert.SerializeObject(new { result, lag });
                     logger.LogInformation("SendBatchEvents: {0} lag", lag);
-                    msgs.Add(new Message(Encoding.Unicode.GetBytes(body)));
+                    batch.Add(new Message(Encoding.Unicode.GetBytes(body)));
 
                 }
-                if (msgs.Any())
+                if (batch.Count > 0)
                 {
-                    await moduleClient.SendEventBatchAsync(msgs, cancellationToken);
-                    logger.LogInformation("wrote {0} messages", msgs.Count);
-                    msgs.Clear();
+                    await moduleClient.SendEventBatchAsync(batch, cancellationToken);
+                    logger.LogInformation("Sent {0} messages", batch.Count);
+                    batch.Clear();
                 }
             }
             logger.LogInformation("SendBatchEvents cancelled");
